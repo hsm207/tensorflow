@@ -30,7 +30,7 @@ limitations under the License.
 #ifdef SWIG
 #define TF_CAPI_EXPORT
 #else
-#if defined(COMPILER_MSVC)
+#if defined(_WIN32)
 #ifdef TF_COMPILE_LIBRARY
 #define TF_CAPI_EXPORT __declspec(dllexport)
 #else
@@ -38,7 +38,7 @@ limitations under the License.
 #endif  // TF_COMPILE_LIBRARY
 #else
 #define TF_CAPI_EXPORT __attribute__((visibility("default")))
-#endif  // COMPILER_MSVC
+#endif  // _WIN32
 #endif  // SWIG
 
 #ifdef __cplusplus
@@ -80,6 +80,16 @@ TF_CAPI_EXPORT extern void TFE_ContextOptionsSetAsync(TFE_ContextOptions*,
 
 TF_CAPI_EXPORT extern void TFE_ContextOptionsSetDevicePlacementPolicy(
     TFE_ContextOptions*, TFE_ContextDevicePlacementPolicy);
+
+// A tensorflow.ServerDef specifies remote workers (in addition to the current
+// workers name). Operations created on this context can then be executed on
+// any of these remote workers by setting an appropriate device.
+//
+// If the following is set, all servers identified by the
+// ServerDef must be up when the context is created.
+TF_CAPI_EXPORT extern void TFE_ContextOptionsSetServerDef(
+    TFE_ContextOptions* options, const void* proto, size_t proto_len,
+    TF_Status* status);
 
 // Destroy an options object.
 TF_CAPI_EXPORT extern void TFE_DeleteContextOptions(TFE_ContextOptions*);
