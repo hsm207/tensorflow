@@ -73,10 +73,7 @@ def pyx_library(
         outs = [filename.split(".")[0] + ".cpp"],
         # Optionally use PYTHON_BIN_PATH on Linux platforms so that python 3
         # works. Windows has issues with cython_binary so skip PYTHON_BIN_PATH.
-        cmd = "PYTHONHASHSEED=0 " + select({
-            "@bazel_tools//src/conditions:windows": "",
-            "//conditions:default": "$${PYTHON_BIN_PATH} ",
-        }) + "$(location @cython//:cython_binary) --cplus $(SRCS) --output-file $(OUTS)",
+        cmd = "PYTHONHASHSEED=0 $(location @cython//:cython_binary) --cplus $(SRCS) --output-file $(OUTS)",
         tools = ["@cython//:cython_binary"] + pxd_srcs,
     )
 
@@ -519,6 +516,9 @@ def tf_additional_proto_srcs():
   return [
       "platform/default/protobuf.cc",
   ]
+
+def tf_additional_human_readable_json_deps():
+  return []
 
 def tf_additional_all_protos():
   return ["//tensorflow/core:protos_all"]
