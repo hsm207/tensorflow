@@ -15,6 +15,7 @@ limitations under the License.
 #include <deque>
 
 #include "tensorflow/core/common_runtime/process_function_library_runtime.h"
+#include "tensorflow/core/framework/dataset.h"
 #include "tensorflow/core/framework/function.h"
 #include "tensorflow/core/framework/op_kernel.h"
 #include "tensorflow/core/framework/resource_op_kernel.h"
@@ -23,6 +24,8 @@ limitations under the License.
 #include "tensorflow/core/util/device_name_utils.h"
 
 namespace tensorflow {
+namespace data {
+namespace {
 
 struct BufferElement {
   // The producer sets `status` if getting the input element fails.
@@ -40,7 +43,8 @@ class FunctionBufferingResource : public ResourceBase {
                             const NameAttrList& func, int64 buffer_size,
                             const string& source_device,
                             const string& target_device,
-                            const std::vector<Tensor>& func_args)
+                            const std::vector<Tensor>& func_args,
+                            const DataTypeVector& output_types)
       : lib_(lib),
         pflr_(std::move(pflr)),
         func_(func),
@@ -48,6 +52,7 @@ class FunctionBufferingResource : public ResourceBase {
         source_device_(source_device),
         target_device_(target_device),
         func_args_(func_args),
+        output_types_(output_types),
         handle_(kInvalidHandle),
         is_buffering_(false),
         end_of_sequence_(false),
@@ -176,6 +181,13 @@ class FunctionBufferingResource : public ResourceBase {
     AllocatorAttributes arg_alloc_attr;
     arg_alloc_attr.set_on_host(true);
     opts.args_alloc_attrs.push_back(arg_alloc_attr);
+    for (const auto& dtype : output_types_) {
+      AllocatorAttributes ret_alloc_attrs;
+      if (DataTypeAlwaysOnHost(dtype)) {
+        ret_alloc_attrs.set_on_host(true);
+      }
+      opts.rets_alloc_attrs.push_back(ret_alloc_attrs);
+    }
     if (opts.source_device != target_device_) {
       opts.remote_execution = true;
     }
@@ -233,6 +245,7 @@ class FunctionBufferingResource : public ResourceBase {
   const string source_device_;
   const string target_device_;
   const std::vector<Tensor> func_args_;
+  const DataTypeVector output_types_;
   FunctionLibraryRuntime::Handle handle_ GUARDED_BY(mu_);
   std::deque<BufferElement> buffer_ GUARDED_BY(mu_);
   std::deque<FunctionBufferCallback> requests_ GUARDED_BY(mu_);
@@ -250,6 +263,7 @@ class FunctionBufferResourceHandleOp : public OpKernel {
     OP_REQUIRES_OK(ctx, ctx->GetAttr("buffer_size", &buffer_size_));
     OP_REQUIRES_OK(ctx, ctx->GetAttr("container", &container_));
     OP_REQUIRES_OK(ctx, ctx->GetAttr("shared_name", &name_));
+    OP_REQUIRES_OK(ctx, ctx->GetAttr("output_types", &output_types_));
   }
 
   ~FunctionBufferResourceHandleOp() override {
@@ -269,17 +283,19 @@ class FunctionBufferResourceHandleOp : public OpKernel {
     std::vector<Tensor> func_args;
     func_args.push_back(*string_arg);
 
+    const string& source_device = ctx->device()->name();
+
     // Obtain and canonicalize target_device.
     const Tensor* target_arg;
     OP_REQUIRES_OK(ctx, ctx->input("target_device", &target_arg));
-    const string& target_device =
-        DeviceNameUtils::CanonicalizeDeviceName(target_arg->scalar<string>()());
+    string target_device;
+    OP_REQUIRES_OK(ctx, DeviceNameUtils::CanonicalizeDeviceName(
+                            target_arg->scalar<string>()(), source_device,
+                            &target_device));
 
     FunctionLibraryRuntime* lib = ctx->function_library();
     OP_REQUIRES(ctx, lib != nullptr,
                 errors::Internal("No function library is provided."));
-
-    const string& source_device = ctx->device()->name();
 
     mutex_lock l(mu_);
     if (!initialized_) {
@@ -297,7 +313,7 @@ class FunctionBufferResourceHandleOp : public OpKernel {
                this](FunctionBufferingResource** ptr) {
                 *ptr = new FunctionBufferingResource(
                     clone_lib, std::move(pflr), func_, buffer_size_,
-                    source_device, target_device, func_args);
+                    source_device, target_device, func_args, output_types_);
                 return Status::OK();
               }));
       core::ScopedUnref s(buffer);
@@ -319,6 +335,7 @@ class FunctionBufferResourceHandleOp : public OpKernel {
   int64 buffer_size_;
   string container_;
   string name_;
+  DataTypeVector output_types_;
 };
 
 REGISTER_KERNEL_BUILDER(Name("FunctionBufferingResource")
@@ -459,4 +476,6 @@ class IteratorGetDeviceOp : public OpKernel {
 REGISTER_KERNEL_BUILDER(Name("IteratorGetDevice").Device(DEVICE_CPU),
                         IteratorGetDeviceOp);
 
+}  // namespace
+}  // namespace data
 }  // namespace tensorflow

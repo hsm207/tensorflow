@@ -14,8 +14,8 @@ limitations under the License.
 ==============================================================================*/
 #include <string.h>
 #include <vector>
-#include "tensorflow/contrib/lite/builtin_op_data.h"
-#include "tensorflow/contrib/lite/context.h"
+#include "tensorflow/contrib/lite/c/builtin_op_data.h"
+#include "tensorflow/contrib/lite/c/c_api_internal.h"
 #include "tensorflow/contrib/lite/kernels/internal/optimized/optimized_ops.h"
 #include "tensorflow/contrib/lite/kernels/internal/reference/reference_ops.h"
 #include "tensorflow/contrib/lite/kernels/internal/tensor.h"
@@ -76,8 +76,9 @@ TfLiteStatus Prepare(TfLiteContext* context, TfLiteNode* node) {
   TF_LITE_ENSURE_EQ(context, NumOutputs(node), op_context.params->num_splits);
 
   auto input_type = op_context.input->type;
-  TF_LITE_ENSURE(context,
-                 input_type == kTfLiteFloat32 || input_type == kTfLiteUInt8);
+  TF_LITE_ENSURE(context, input_type == kTfLiteFloat32 ||
+                              input_type == kTfLiteUInt8 ||
+                              input_type == kTfLiteInt16);
   for (int i = 0; i < NumOutputs(node); ++i) {
     GetOutput(context, node, i)->type = input_type;
   }
@@ -137,9 +138,14 @@ TfLiteStatus Eval(TfLiteContext* context, TfLiteNode* node) {
       TF_LITE_SPLIT(uint8_t);
       break;
     }
+    case kTfLiteInt16: {
+      TF_LITE_SPLIT(int16_t);
+      break;
+    }
     default:
       context->ReportError(
-          context, "Only float32 and uint8 are currently supported, got %d.",
+          context,
+          "Only float32, uint8 and int16 are currently supported, got %d.",
           op_context.input->type);
       return kTfLiteError;
   }

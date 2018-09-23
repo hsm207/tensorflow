@@ -60,8 +60,8 @@ namespace internal {
 Status ValidateDevice(OpKernelContext* ctx, const ResourceHandle& p) {
   if (ctx->device()->attributes().name() != p.device()) {
     return errors::InvalidArgument(
-        "Trying to access resource located in device ", p.device(),
-        " from device ", ctx->device()->attributes().name());
+        "Trying to access resource ", p.name(), " located in device ",
+        p.device(), " from device ", ctx->device()->attributes().name());
   }
   return Status::OK();
 }
@@ -271,7 +271,7 @@ string ContainerInfo::DebugString() const {
                          "]");
 }
 
-ResourceHandle HandleFromInput(OpKernelContext* ctx, int input) {
+const ResourceHandle& HandleFromInput(OpKernelContext* ctx, int input) {
   return ctx->input(input).flat<ResourceHandle>()(0);
 }
 

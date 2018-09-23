@@ -18,6 +18,7 @@ limitations under the License.
 #include <algorithm>
 #include <vector>
 
+#include "absl/memory/memory.h"
 #include "tensorflow/compiler/xla/map_util.h"
 #include "tensorflow/compiler/xla/util.h"
 
@@ -27,15 +28,55 @@ using tensorflow::gtl::FlatMap;
 using tensorflow::gtl::FlatSet;
 
 /*static*/
+StatusOr<int64> HeapSimulator::MinimumMemoryForModule(
+    const HloSchedule& schedule,
+    const LogicalBuffer::SizeFunction& size_function) {
+  if (schedule.empty()) {
+    return 0;
+  }
+
+  const HloModule* module = schedule.module();
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<TuplePointsToAnalysis> points_to_analysis,
+                      TuplePointsToAnalysis::Run(module));
+
+  // The absolute minimum memory required for a given sequence of instructions
+  // is determined by the sequence of Alloc and Free calls on a simulated heap,
+  // ignoring fragmentation. We run the heap simulation on the whole module,
+  // rather than summing each computation, since it gives us a better lower
+  // bound, by minimizing the liveness of sub-computations.
+  TF_ASSIGN_OR_RETURN(
+      HeapSimulator::Result result,
+      HeapSimulator::Run(absl::make_unique<NoFragmentationStatsHeap>(), *module,
+                         schedule, *points_to_analysis, size_function));
+  return result.heap_size;
+}
+
+/*static*/
+StatusOr<int64> HeapSimulator::MinimumMemoryForComputation(
+    const HloComputation& computation, const HloInstructionSequence& sequence,
+    const TuplePointsToAnalysis& points_to_analysis,
+    const LogicalBuffer::SizeFunction& size_function,
+    const tensorflow::gtl::FlatMap<const HloComputation*, int64>*
+        memory_by_computation) {
+  TF_ASSIGN_OR_RETURN(
+      HeapSimulator::Result result,
+      HeapSimulator::Run(absl::make_unique<NoFragmentationStatsHeap>(),
+                         computation, sequence, points_to_analysis,
+                         size_function, HeapSimulator::Options(),
+                         memory_by_computation));
+  return result.heap_size;
+}
+
+/*static*/
 StatusOr<HeapSimulator::Result> HeapSimulator::Run(
     std::unique_ptr<HeapAlgorithm> algorithm, const HloModule& module,
-    const SequentialHloOrdering::HloModuleSequence& module_sequence,
+    const HloSchedule& schedule,
     const TuplePointsToAnalysis& points_to_analysis,
     const BufferValue::SizeFunction& size_fn, const Options& options) {
-  HeapSimulator heap(std::move(algorithm), size_fn, options, &module_sequence);
+  HeapSimulator heap(std::move(algorithm), size_fn, options, &schedule);
   const HloComputation* entry_computation = module.entry_computation();
-  const std::vector<const HloInstruction*>& instruction_sequence =
-      FindOrDie(module_sequence, entry_computation);
+  const HloInstructionSequence& instruction_sequence =
+      schedule.sequence(entry_computation);
   TF_RETURN_IF_ERROR(heap.RunComputation(
       *entry_computation, instruction_sequence, points_to_analysis));
   return heap.Finish();
@@ -44,11 +85,13 @@ StatusOr<HeapSimulator::Result> HeapSimulator::Run(
 /*static*/
 StatusOr<HeapSimulator::Result> HeapSimulator::Run(
     std::unique_ptr<HeapAlgorithm> algorithm, const HloComputation& computation,
-    const std::vector<const HloInstruction*>& instruction_sequence,
+    const HloInstructionSequence& instruction_sequence,
     const TuplePointsToAnalysis& points_to_analysis,
-    const BufferValue::SizeFunction& size_fn, const Options& options) {
+    const BufferValue::SizeFunction& size_fn, const Options& options,
+    const tensorflow::gtl::FlatMap<const HloComputation*, int64>*
+        memory_by_computation) {
   HeapSimulator heap(std::move(algorithm), size_fn, options,
-                     /*module_sequence=*/nullptr);
+                     /*schedule=*/nullptr, memory_by_computation);
   TF_RETURN_IF_ERROR(heap.RunComputation(computation, instruction_sequence,
                                          points_to_analysis));
   return heap.Finish();
@@ -58,7 +101,7 @@ StatusOr<HeapSimulator::Result> HeapSimulator::Run(
 // 'instruction_sequence'.
 Status HeapSimulator::RunComputation(
     const HloComputation& computation,
-    const std::vector<const HloInstruction*>& instruction_sequence,
+    const HloInstructionSequence& instruction_sequence,
     const TuplePointsToAnalysis& points_to_analysis) {
   VLOG(3) << "Computation:\n" << computation.ToString();
   // The goal here is to minimize memory usage, assuming the given sequential
@@ -89,7 +132,8 @@ Status HeapSimulator::RunComputation(
   // set of instructions that need to be visited contains all users of all
   // aliases, that is, all users of all instructions that have the buffer
   // contained in their points-to set.
-  for (const HloInstruction* instruction : instruction_sequence) {
+  for (const HloInstruction* instruction :
+       instruction_sequence.instructions()) {
     const PointsToSet& points_to =
         points_to_analysis.GetPointsToSet(instruction);
     const PointsToSet::BufferSet& buffer_set = points_to.CreateFlattenedSet();
@@ -100,7 +144,7 @@ Status HeapSimulator::RunComputation(
         }
       } else {
         // A GetTupleElement doesn't need to keep all of its operand's buffers
-        // alive. It only needs the buffers that relate to the element its
+        // alive. It only needs the buffers that relate to the element it's
         // extracting, and the tuple it's extracting from, but not the buffers
         // for the other elements.
         for (const BufferValue* buffer : points_to.element({})) {
@@ -122,7 +166,8 @@ Status HeapSimulator::RunComputation(
 
   std::vector<const BufferValue*> dead_buffers_to_free;
   std::vector<const BufferValue*> operand_buffers_to_free;
-  for (const HloInstruction* instruction : instruction_sequence) {
+  for (const HloInstruction* instruction :
+       instruction_sequence.instructions()) {
     const TuplePointsToAnalysis::BufferDefinitionVector&
         buffers_defined_by_instruction =
             points_to_analysis.GetBuffersDefinedByInstruction(instruction);
@@ -188,6 +233,9 @@ Status HeapSimulator::RunComputation(
     //
     // INVARIANT: Either Alloc or ShareBuffer will be called for each buffer
     // that we should assign.
+
+    // Make sure each buffer get reused at most once.
+    FlatSet<const BufferValue*> reused_buffers;
     for (const BufferValue* buffer : buffers_defined_by_instruction) {
       if (IgnoreBuffer(buffer)) {
         continue;
@@ -200,6 +248,9 @@ Status HeapSimulator::RunComputation(
       bool shared = false;
       if (options_.may_reuse_operand_buffers) {
         for (const BufferValue* operand_buffer : operand_buffers_to_free) {
+          if (reused_buffers.count(operand_buffer) != 0) {
+            continue;
+          }
           if (buffer->instruction()->IsUserOf(operand_buffer->instruction()) &&
               buffer->instruction()->opcode() != HloOpcode::kCopy &&
               points_to_analysis.CanShareOperandBufferWithUser(
@@ -209,6 +260,7 @@ Status HeapSimulator::RunComputation(
                     << operand_buffer->ToString();
             ShareBuffer(buffer, operand_buffer, instruction);
             shared = true;
+            reused_buffers.insert(operand_buffer);
             break;
           }
         }
@@ -219,23 +271,29 @@ Status HeapSimulator::RunComputation(
         Alloc(buffer, instruction);
       }
     }
+    // Account for the memory used by subcomputations when estimating the
+    // current heap size.
+    if (memory_by_computation_ != nullptr) {
+      algorithm_->AccountForSubcomputationMemory(instruction,
+                                                 *memory_by_computation_);
+    }
 
-    // If the whole module is sequential, we can save memory by running the
-    // heap-simulation for sub-computations inline. E.g. the buffers for the
-    // condition and body of a kWhile instruction are only live for the duration
-    // of the instruction itself.
+    // If all computations in the module have been scheduled, we can save memory
+    // by running the heap-simulation for sub-computations inline. E.g. the
+    // buffers for the condition and body of a kWhile instruction are only live
+    // for the duration of the instruction itself.
     //
     // The order that the sub-computations are simulated does not affect
-    // correctness; since the whole module is sequential, we know that the
+    // correctness; since the whole module has been scheduled, we know that the
     // sub-computations will never be run concurrently.
-    if (module_sequence_ != nullptr) {
+    if (schedule_ != nullptr) {
       if (instruction->opcode() == HloOpcode::kCall ||
           instruction->opcode() == HloOpcode::kConditional ||
           instruction->opcode() == HloOpcode::kWhile) {
         for (const HloComputation* called_computation :
              instruction->called_computations()) {
-          const std::vector<const HloInstruction*>& called_sequence =
-              FindOrDie(*module_sequence_, called_computation);
+          const HloInstructionSequence& called_sequence =
+              schedule_->sequence(called_computation);
           TF_RETURN_IF_ERROR(RunComputation(
               *called_computation, called_sequence, points_to_analysis));
         }
@@ -286,13 +344,16 @@ Status HeapSimulator::RunComputation(
 HeapSimulator::HeapSimulator(
     std::unique_ptr<HeapAlgorithm> algorithm,
     const BufferValue::SizeFunction& size_fn, const Options& options,
-    const SequentialHloOrdering::HloModuleSequence* module_sequence)
-    : no_fragmentation_stats_(MakeUnique<NoFragmentationStatsHeap>()),
+    const HloSchedule* schedule,
+    const tensorflow::gtl::FlatMap<const HloComputation*, int64>*
+        memory_by_computation)
+    : no_fragmentation_stats_(absl::make_unique<NoFragmentationStatsHeap>()),
       algorithm_(std::move(algorithm)),
       size_fn_(size_fn),
       options_(options),
-      module_sequence_(module_sequence) {
-  debug_trace_.set_whole_module_simulation(module_sequence_ != nullptr);
+      schedule_(schedule),
+      memory_by_computation_(memory_by_computation) {
+  debug_trace_.set_whole_module_simulation(schedule_ != nullptr);
 }
 
 HeapSimulator::~HeapSimulator() {}
@@ -320,9 +381,10 @@ void HeapSimulator::Alloc(const BufferValue* buffer,
 
   allocated_buffers_.insert(buffer);
   const int64 size = size_fn_(*buffer);
-  algorithm_->Alloc(buffer, size);
-  no_fragmentation_stats_->Alloc(buffer, size);
-
+  const HloInstruction* instruction_to_calc_aliasing =
+      memory_by_computation_ == nullptr ? nullptr : instruction;
+  algorithm_->Alloc(buffer, size, instruction_to_calc_aliasing);
+  no_fragmentation_stats_->Alloc(buffer, size, instruction_to_calc_aliasing);
   FillDebugTrace(HeapSimulatorTrace::Event::ALLOC, buffer, instruction,
                  nullptr);
 }
@@ -458,6 +520,38 @@ void NoFragmentationStatsHeap::Alloc(const BufferValue* buffer, int64 size) {
   if (current_heap_size_ > max_heap_size_) {
     max_heap_size_ = current_heap_size_;
   }
+}
+
+void NoFragmentationStatsHeap::Alloc(const BufferValue* buffer, int64 size,
+                                     const HloInstruction* instruction) {
+  // The output buffer of while/call/conditional is always aliased with the
+  // output buffer of the root instruction in the body. Don't double count.
+  if (instruction == nullptr ||
+      (instruction->opcode() != HloOpcode::kWhile &&
+       instruction->opcode() != HloOpcode::kCall &&
+       instruction->opcode() != HloOpcode::kConditional)) {
+    Alloc(buffer, size);
+  }
+}
+
+void NoFragmentationStatsHeap::AccountForSubcomputationMemory(
+    const HloInstruction* instruction,
+    const tensorflow::gtl::FlatMap<const HloComputation*, int64>&
+        memory_by_computation) {
+  // We only count the memory usage of the largest subcomputation, instead of
+  // adding them all, because subcomputations won't execute in parallel.
+  int64 max_subcomputation_bytes = 0;
+  for (const auto* c : instruction->called_computations()) {
+    auto it = memory_by_computation.find(c);
+    if (it != memory_by_computation.end()) {
+      int64 subcomputation_bytes = it->second;
+      if (subcomputation_bytes > max_subcomputation_bytes) {
+        max_subcomputation_bytes = subcomputation_bytes;
+      }
+    }
+  }
+  max_heap_size_ =
+      std::max(max_heap_size_, current_heap_size_ + max_subcomputation_bytes);
 }
 
 void NoFragmentationStatsHeap::Free(const BufferValue* buffer, int64 size) {
@@ -640,6 +734,210 @@ HeapSimulator::Result LazyBestFitHeap::Finish() {
     CHECK_EQ(free_.begin()->size, result_.heap_size);
   }
   return result_;
+}
+
+void GlobalDecreasingSizeBestFitHeap::Alloc(const BufferValue* buffer,
+                                            int64 size) {
+  // Degenerate case: 0-sized buffers are always allocated at offset 0.
+  if (size == 0) {
+    result_.chunk_map.emplace(buffer, Chunk{0, 0});
+    return;
+  }
+  auto emplace_result = buffer_intervals_.emplace(
+      buffer, BufferInterval{buffer, size, current_time_, -1});
+  DCHECK(emplace_result.second);
+  ++current_time_;
+}
+
+void GlobalDecreasingSizeBestFitHeap::Free(const BufferValue* buffer,
+                                           int64 size) {
+  // Degenerate case: 0-sized buffers are always allocated at offset 0.
+  if (size == 0) {
+    return;
+  }
+  BufferInterval& buffer_interval = FindOrDie(buffer_intervals_, buffer);
+  DCHECK_EQ(buffer_interval.buffer, buffer);
+  DCHECK_EQ(buffer_interval.size, size);
+  DCHECK_EQ(buffer_interval.end, -1);
+  buffer_interval.end = current_time_;
+  ++current_time_;
+}
+
+namespace {
+
+// Node in BufferIntervalTree that stores the alloc and free times of a buffer,
+// and the chunk assigned to it.
+struct BufferIntervalTreeNode {
+  // Alloc time.
+  int64 start;
+  // Free time.
+  int64 end;
+  // Maximum free time of all nodes in the subtree where this node is the root.
+  int64 subtree_end;
+  // Allocated chunk for the buffer.
+  HeapSimulator::Chunk chunk;
+  // Left child.
+  BufferIntervalTreeNode* left;
+  // Right child.
+  BufferIntervalTreeNode* right;
+};
+
+// An interval tree that can query buffers overlapping in time.
+class BufferIntervalTree {
+ public:
+  explicit BufferIntervalTree(int capacity) : node_storage_(capacity) {}
+
+  using Chunk = HeapSimulator::Chunk;
+
+  // Adds a buffer to the interval tree, with the time interval and allocated
+  // chunk specified.
+  void Add(int64 start, int64 end, const Chunk& chunk) {
+    int index = node_count_;
+    DCHECK_LT(index, node_storage_.size());
+    ++node_count_;
+
+    node_storage_[index] =
+        BufferIntervalTreeNode{start, end, end, chunk, nullptr, nullptr};
+
+    if (index == 0) {
+      // This is root.
+      return;
+    }
+
+    BufferIntervalTreeNode* parent = &node_storage_[0];
+    while (true) {
+      parent->subtree_end = std::max(parent->subtree_end, end);
+      if (parent->start > start) {
+        if (parent->left == nullptr) {
+          parent->left = &node_storage_[index];
+          return;
+        }
+        parent = parent->left;
+      } else {
+        if (parent->right == nullptr) {
+          parent->right = &node_storage_[index];
+          return;
+        }
+        parent = parent->right;
+      }
+    }
+  }
+
+  // Returns vector of allocated chunks that overlap with the given time
+  // interval.
+  std::vector<Chunk> ChunksOverlappingInTime(int64 start, int64 end) {
+    std::vector<Chunk> result;
+    if (node_count_ > 0) {
+      ChunksOverlappingInTimeHelper(start, end, &node_storage_[0], &result);
+    }
+    return result;
+  }
+
+ private:
+  void ChunksOverlappingInTimeHelper(int64 start, int64 end,
+                                     BufferIntervalTreeNode* visiting_node,
+                                     std::vector<Chunk>* result) {
+    if (start > visiting_node->subtree_end) {
+      return;
+    }
+    if (visiting_node->left != nullptr) {
+      ChunksOverlappingInTimeHelper(start, end, visiting_node->left, result);
+    }
+    if (visiting_node->start <= end && visiting_node->end >= start) {
+      result->push_back(visiting_node->chunk);
+    }
+    if (end < visiting_node->start) {
+      return;
+    }
+    if (visiting_node->right != nullptr) {
+      ChunksOverlappingInTimeHelper(start, end, visiting_node->right, result);
+    }
+  }
+
+  int64 node_count_ = 0;
+  std::vector<BufferIntervalTreeNode> node_storage_;
+};
+
+}  // namespace
+
+HeapSimulator::Result GlobalDecreasingSizeBestFitHeap::Finish() {
+  std::vector<BufferInterval> sorted_buffer_intervals;
+  for (auto& entry : buffer_intervals_) {
+    sorted_buffer_intervals.push_back(entry.second);
+  }
+  std::sort(sorted_buffer_intervals.begin(), sorted_buffer_intervals.end(),
+            [](const BufferInterval& x, const BufferInterval& y) {
+              if (x.size != y.size) {
+                return x.size > y.size;
+              }
+              if (x.end - x.start != y.end - y.start) {
+                return x.end - x.start > y.end - y.start;
+              }
+              return x.buffer->id() < y.buffer->id();
+            });
+
+  BufferIntervalTree interval_tree(sorted_buffer_intervals.size());
+  for (auto& buffer_interval : sorted_buffer_intervals) {
+    auto chunks_overlapping_in_time = interval_tree.ChunksOverlappingInTime(
+        buffer_interval.start, buffer_interval.end);
+    std::sort(
+        chunks_overlapping_in_time.begin(), chunks_overlapping_in_time.end(),
+        [](const Chunk& x, const Chunk& y) { return x.offset < y.offset; });
+
+    // Find the minimum free chunk that can hold this buffer.
+    Chunk min_fit_chunk{-1, INT64_MAX};
+    auto use_free_chunk_if_smaller = [&](int64 free_offset, int64 free_size) {
+      if (free_size < buffer_interval.size) {
+        return;
+      }
+
+      if (free_size < min_fit_chunk.size) {
+        min_fit_chunk = {free_offset, free_size};
+      }
+    };
+
+    int64 offset = 0;
+    for (auto& chunk : chunks_overlapping_in_time) {
+      if (offset < chunk.offset) {
+        use_free_chunk_if_smaller(offset, chunk.offset - offset);
+      }
+      offset =
+          std::max(offset, RoundUpToNearest(chunk.chunk_end(), alignment_));
+    }
+    use_free_chunk_if_smaller(offset, result_.heap_size - offset);
+
+    if (min_fit_chunk.offset == -1) {
+      // Increase the heap size to fit in the last free chunk.
+      result_.heap_size = offset + buffer_interval.size;
+      min_fit_chunk = {offset, buffer_interval.size};
+    }
+
+    min_fit_chunk.size = buffer_interval.size;
+    const auto emplace_result =
+        result_.chunk_map.emplace(buffer_interval.buffer, min_fit_chunk);
+    DCHECK(emplace_result.second);
+
+    interval_tree.Add(buffer_interval.start, buffer_interval.end,
+                      min_fit_chunk);
+  }
+  return result_;
+}
+
+HeapSimulator::Result ChooseBestHeapAlgorithm::Finish() {
+  DCHECK(!algorithms_.empty());
+  std::vector<Result> results(algorithms_.size());
+  int64 min_size = INT64_MAX;
+  int min_size_index = -1;
+  for (int i = 0; i < algorithms_.size(); ++i) {
+    results[i] = algorithms_[i]->Finish();
+    if (results[i].heap_size < min_size) {
+      min_size = results[i].heap_size;
+      min_size_index = i;
+    }
+  }
+
+  DCHECK_GE(min_size_index, 0);
+  return results[min_size_index];
 }
 
 }  // namespace xla
